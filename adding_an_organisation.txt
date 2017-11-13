@@ -1,0 +1,190 @@
+//First we should bring down any existing docker networks we have created.
+
+./byfn.sh -m down
+
+//Now let's regenerate the cryptographic material.
+
+./byfn.sh -m generate
+
+//And now let's bring the network up. (This will create the channel, create the genesis blocks for the anchor peers and channel).
+
+./byfn.sh -m up
+
+//Lets go into the org-3 artifacts folder and generate the cryptographic material
+
+../../bin/cryptogen generate --config=./org3-crypto.yaml
+
+//Now the crypto-config folder has been populated with cryptomaterial for the peerOrganisations. Now we can initialise the configuration for org3. We are going to be appending this info to the config block.
+(Before this step, please make sure the FABRIC_CFG_PATH has been set so that the configtx.yaml file can be found)
+
+export FABRIC_CFG_PATH=$PWD
+
+../../bin/configtxgen -printOrg Org3MSP > ../channel-artifacts/org3.json
+
+//We will now copy over the orderer crypto material generated in ./byfn.sh -m up over to the org3 crypto-config folder
+
+cp -r ../crypto-config/ordererOrganizations crypto-config
+
+//Now let's jump into the cli container and do the updates on the channel.
+
+docker exec -it cli bash
+
+//And install jq
+
+apt update && apt install jq
+
+//Now start the configtxlator tool inside the cli container:
+
+configtxlator start &
+
+//Open a new window, go into the cli container again and export the url
+
+docker exec -it cli bash
+export CONFIGTXLATOR_URL=http://127.0.0.1:7059
+
+//Export the ORDERER_CA and the channel name:
+
+export ORDERER_CA=/opt/gopath/src/github.com/hyperledger/fabric/peer/crypto/ordererOrganizations/example.com/orderers/orderer.example.com/msp/tlscacerts/tlsca.example.com-cert.pem
+
+export CHANNEL_NAME=mychannel
+
+//We are now ready to fetch the configuration block. We are not fetching the genesis block, we are fetching the most recent config block. When we ran through the embedded script.sh, we sent two additional updates. We have the orginal genesis block and we have two other configurations where we defined the anchor peers for ORG1 and ORG2
+
+peer channel fetch config config_block.pb -o orderer.example.com:7050 -c $CHANNEL_NAME --tls --cafile $ORDERER_CA
+
+//You will notice that we received block 2. That's because block0 was the genesis config block, block1 was updating the anchor peer for ORG1 and block2 was updating the anchor peer for ORG2. Now we have the block, //we need to turn it into json so that it is editable. We will use the configtxlator  and  jq tools to do this.
+
+curl -X POST --data-binary @config_block.pb "$CONFIGTXLATOR_URL/protolator/decode/common.Block" | jq . > config_block.json
+
+//Here we are saying, take config_block.pb go to this URL and spit out config_block.json. Now we isolate the current config specific information - this removes unnecessary elements from the block (header, channel info, signatures, etc...)
+
+jq .data.data[0].payload.data.config config_block.json > config.json
+
+//We now want to append the org.json file we generated earlier to the config.json
+
+jq -s '.[0] * {"channel_group":{"groups":{"Application":{"groups":{"Org3MSP":.[1]}}}}}' config.json ./channel-artifacts/org3.json >& updated_config.json
+
+//This is saying take config.json(.[0]) and append (*) org3.json(.[1]) to the groups definition. If you now look in the updated_config.json ORG3 has been added to the groups. (originally there was just ORG1, ORG2) Remember we no longer have the headers in this file. We now want to turn config.json and updated_config.json back into a protobuffer.
+
+curl -X POST --data-binary @config.json "$CONFIGTXLATOR_URL/protolator/encode/common.Config" > config.pb
+
+curl -X POST --data-binary @updated_config.json "$CONFIGTXLATOR_URL/protolator/encode/common.Config" > updated_config.pb
+
+//We want to now find the difference between config.pb and updated_config.pb so that we can isolate just the ORG3 information.
+
+curl -X POST -F channel=$CHANNEL_NAME -F "original=@config.pb" -F "updated=@updated_config.pb" "${CONFIGTXLATOR_URL}/configtxlator/compute/update-from-configs" > config_update.pb
+
+//Now we will turn config_update.pb back into json:
+
+curl -X POST --data-binary @config_update.pb "$CONFIGTXLATOR_URL/protolator/decode/common.ConfigUpdate" | jq . > config_update.json
+
+//wrap all the stuff that we stripped down back on to it:
+
+echo '{"payload":{"header":{"channel_header":{"channel_id":"mychannel","type":2}},"data":{"config_update":'$(cat config_update.json)'}}}' | jq . > config_update_in_envelope.json
+
+//And put it back into protobuffer:
+
+curl -X POST --data-binary @config_update_in_envelope.json "$CONFIGTXLATOR_URL/protolator/encode/common.Envelope" > config_update_in_envelope.pb
+
+//We must now sign this as ORG1 admin before adding to channel. Remember the variables for ORG1 are already defined in the embedded script.
+
+peer channel signconfigtx -f config_update_in_envelope.pb
+
+//Now we need to hopscotch to the ORG2 identity to sign it away. Note if you try to update the config file using ORG1 you will be thrown an error because each organisation is required to agree:
+
+export CORE_PEER_MSPCONFIGPATH=/opt/gopath/src/github.com/hyperledger/fabric/peer/crypto/peerOrganizations/org2.example.com/users/Admin\@org2.example.com/msp/ && export CORE_PEER_ADDRESS=peer0.org2.example.com:7051 && export CORE_PEER_LOCALMSPID="Org2MSP" && export CORE_PEER_TLS_ROOTCERT_FILE=/opt/gopath/src/github.com/hyperledger/fabric/peer/crypto/peerOrganizations/org2.example.com/peers/peer0.org2.example.com/tls/ca.crt
+
+//We don't need to sign it again, that comes for free when ORG2 tries to update:
+
+peer channel update -f config_update_in_envelope.pb -c $CHANNEL_NAME -o orderer.example.com:7050 --tls true --cafile $ORDERER_CA
+
+//Now ORG3 is defined in the writer's policy. Change windows and spin up the two peer containers of ORG3.
+
+docker-compose -f docker-compose-org3.yaml up
+
+//Change windows again and jump into the ORG3cli:
+
+docker exec -it Org3cli bash
+
+//And load in the variables again:
+
+export ORDERER_CA=/opt/gopath/src/github.com/hyperledger/fabric/peer/crypto/ordererOrganizations/example.com/orderers/orderer.example.com/msp/tlscacerts/tlsca.example.com-cert.pem
+
+export CHANNEL_NAME=mychannel
+
+
+//When you join a channel, you must start on the genesis block. We do this using the fetch command. Notice the 0, that is selecting the earliest block aka the genesis block
+
+peer channel fetch 0 mychannel.block -o orderer.example.com:7050 -c $CHANNEL_NAME --tls --cafile $ORDERER_CA
+
+//If you ls now you will see that mychannel.block has been fetched now. Let's now join it:
+
+peer channel join -b mychannel.block
+
+//Lets also join peer 1. Change the certificate file before jumping in.
+
+export CORE_PEER_TLS_ROOTCERT_FILE=/opt/gopath/src/github.com/hyperledger/fabric/peer/crypto/peerOrganizations/org3.example.com/peers/peer1.org3.example.com/tls/ca.crt
+
+export CORE_PEER_ADDRESS=peer1.org3.example.com:7051
+
+//Now join this peer:
+
+peer channel join -b mychannel.block
+
+//Back to peer0:
+
+export CORE_PEER_TLS_ROOTCERT_FILE=/opt/gopath/src/github.com/hyperledger/fabric/peer/crypto/peerOrganizations/org3.example.com/peers/peer0.org3.example.com/tls/ca.crt
+
+export CORE_PEER_ADDRESS=peer0.org3.example.com:7051
+
+//Now we have to upgrade the chaincode so that it defines ORG3 as part of it's emdorsement policy. Still on Org3cli, let's install chaincode version 2.0, as we are going to upgrade the source code anyway on the other organisations.
+
+peer chaincode install -n mycc -v 2.0 -p github.com/chaincode/chaincode_example02/go/
+
+//Now hop back to the original cli and install the same version on the Org1 and Org2 peers.
+
+peer chaincode install -n mycc -v 2.0 -p github.com/chaincode/chaincode_example02/go/
+
+//If you are still on the same window that you opened before then you will have to change variables back to ORG1 and install chaincode to that organisation:
+
+export CORE_PEER_MSPCONFIGPATH=/opt/gopath/src/github.com/hyperledger/fabric/peer/crypto/peerOrganizations/org1.example.com/users/Admin\@org1.example.com/msp/ && export CORE_PEER_ADDRESS=peer0.org1.example.com:7051 && export CORE_PEER_LOCALMSPID="Org1MSP" && export CORE_PEER_TLS_ROOTCERT_FILE=/opt/gopath/src/github.com/hyperledger/fabric/peer/crypto/peerOrganizations/org1.example.com/peers/peer0.org1.example.com/tls/ca.crt
+
+peer chaincode install -n mycc -v 2.0 -p github.com/chaincode/chaincode_example02/go/
+
+//Now we have all the version 2's installed on peer0 of ORG1, ORG2 and ORG3. We are now ready to upgrade.
+
+peer chaincode upgrade -o orderer.example.com:7050 --tls $CORE_PEER_TLS_ENABLED --cafile $ORDERER_CA -C $CHANNEL_NAME -n mycc -v 2.0 -c '{"Args":["init","a","90","b","210"]}' -P "OR('Org1MSP.member', 'Org2MSP.member', 'Org3MSP.member')"
+
+//Note that we had to reinitialise the state by defining the account balances of a and b. In your chaincode, if you require an initialisation, this is going to happen. This is NOT good practice. We would want the state in version 1 to persist or else the peer could define the variables to be anything they want.
+
+//Now change over to ORG3cli to see if this has infact changed over.
+
+peer chaincode query -C $CHANNEL_NAME -n mycc -c '{"Args":["query","a"]}'
+
+//Lastly we will show that we can manipulate the state:
+
+peer chaincode invoke -o orderer.example.com:7050 --tls $CORE_PEER_TLS_ENABLED --cafile $ORDERER_CA -C $CHANNEL_NAME -n mycc -c '{"Args":["invoke","a","b","10"]}'
+
+
+//Query again on a to see if it has infact changed.
+
+
+------------------------------------------------------------------------------------------------------
+
+In summary:
+
+1) Pull the most updated configuration block.
+2) Parse the block to json.
+3) Strip headers of the configuration block.
+4) Append the org3.json definition.
+5) Convert both the new config and old config back to protobuffer.
+6) Calculate the change in the two protobuffers.
+7) Decode back to json.
+8) Wrap it back up with the headers.
+9) Encode it back into protobuffer.
+10) Sign it off with the original ORGS and update the Config block.
+11) Install chaincode onto ORG3 peer (new version).
+12) Install new chaincode version onto ORG1 and ORG2.
+13) Use ORG1 or ORG2 to upgrade the chaincode to include ORG3 in the endorsement policy.
+
+
